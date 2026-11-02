@@ -150,7 +150,8 @@ def save_tokens_for_server(server, uids):
         print(f"💾 Saved {len(tokens)} tokens → {fname}")
         return True
     except Exception as e:
-        print(f"⚠️ Failed to save {fname}: {e}")
+        # Vercel-এ Read-only এরর আসলে এখানে হ্যান্ডেল হবে, অ্যাপ ক্র্যাশ করবে না
+        print(f"⚠️ Failed to save {fname} (Vercel Read-only): {e}")
         return False
 
 def load_tokens_from_file(server):
@@ -315,6 +316,185 @@ async def prewarm_tokens(accs, server=None, force=False):
                     t = await get_valid_token(session, a['uid'], a['password'], force=force)
                     if not t:
                         return None
+                    return a
+            results = await asyncio.gather(*[one(a) for a in need_fetch], return_exceptions=True)
+        valid_fetched = [r for r in results if isinstance(r, dict)]
+
+    combined = already_valid + valid_fetched
+
+    if server is not None:
+        filtered = []
+        for a in combined:
+            c = TOKEN_CACHE.get(a['uid']) or {}
+            if region_matches(region_of(c.get("login_url"), c.get("region")), server):
+                filtered.append(a)
+        combined = filtered
+
+    print(f"✅ Prewarm[{tag}]: {len(combined)}/{len(accs)} valid")
+    return combined
+
+async def broadcast_likes(target, server, url, valid_accs):
+    pb = make_pb(target, server)
+    enc_uid = encrypt_msg(pb)
+    done = liked_cache.get(target, set())
+    fresh = [a for a in valid_accs if a['uid'] not in done]
+    if not fresh:
+        return {"success": 0, "failed": 0}
+    random.shuffle(fresh)
+    sem = asyncio.Semaphore(LIKE_CONCURRENCY)
+    connector = aiohttp.TCPConnector(limit=LIKE_CONCURRENCY * 2, force_close=False)
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async def one(a):
+            async with sem:
+                c = TOKEN_CACHE.get(a['uid']) or {}
+                ep = f"{c['login_url'].rstrip('/')}/LikeProfile" if c.get("login_url") else url
+                tok = c.get("token")
+                if not tok:
+                    return 500
+                st = await send_like(session, enc_uid, tok, ep)
+                if st == 200:
+                    liked_cache[target].add(a['uid'])
+                return st
+        results = await asyncio.gather(*[one(a) for a in fresh], return_exceptions=True)
+    ok = sum(1 for r in results if r == 200)
+    return {"success": ok, "failed": len(results) - ok}
+
+def enc(uid):
+    m = uid_generator_pb2.uid_generator()
+    fs = list(m.DESCRIPTOR.fields)
+    setattr(m, fs[0].name, int(uid))
+    if len(fs) > 1:
+        setattr(m, fs[1].name, 1)
+    return encrypt_msg(m.SerializeToString())
+
+def decode(b):
+    try:
+        i = like_count_pb2.Info()
+        i.ParseFromString(b)
+        return i
+    except Exception:
+        return None
+
+def get_info(enc_uid, server, token):
+    url = URLS.get(server, URLS["IND"])
+    h = {
+        'User-Agent': UA, 'Accept': "*/*", 'Accept-Encoding': "deflate, gzip",
+        'X-GA-SV': XGA_SV, 'Authorization': f"Bearer {token}", 'X-GA': "v1 1",
+        'ReleaseVersion': REL_V, 'Content-Type': "application/x-www-form-urlencoded",
+        'X-Unity-Version': UNITY_V
+    }
+    try:
+        r = requests.post(f"{url}/GetPlayerPersonalShow", data=bytes.fromhex(enc_uid), headers=h, verify=False, timeout=10)
+        return decode(r.content)
+    except Exception:
+        return None
+
+# রুট পেজ যুক্ত করা হলো যাতে Vercel এ 404 না আসে
+@app.route('/')
+def home():
+    return jsonify({"status": "active", "message": "MZ MINHAZ API is running!"})
+
+@app.route('/like')
+def like():
+    uid = request.args.get("uid")
+    server = request.args.get("server_name", "").upper()
+    ip = request.remote_addr
+
+    if not uid or not server:
+        return jsonify({"error": "UID and server_name required"}), 400
+    if server not in URLS:
+        return jsonify({"error": f"Invalid server. Use: {list(URLS.keys())}"}), 400
+
+    accs = load_accounts(server)
+    if not accs:
+        return jsonify({"error": f"No accounts available for {server}"}), 500
+
+    mid = midnight()
+    cnt, lr = tracker[ip]
+    if lr < mid:
+        tracker[ip] = [0, time.time()]
+        cnt = 0
+    if cnt >= KEY_LIMIT:
+        return jsonify({"error": "Daily limit reached", "remains": f"(0/{KEY_LIMIT})"}), 429
+
+    t0 = time.time()
+
+    valid_accs = asyncio.run(prewarm_tokens(accs, server=server, force=False))
+    if not valid_accs:
+        return jsonify({"error": f"No valid {server} accounts"}), 500
+
+    tok = TOKEN_CACHE[valid_accs[0]['uid']]['token']
+    enc_uid = enc(uid)
+
+    b = get_info(enc_uid, server, tok)
+    if b is None:
+        return jsonify({"error": "Invalid UID or server mismatch", "status": 0}), 200
+    try:
+        bd = json.loads(MessageToJson(b))
+        bl = int(bd['AccountInfo'].get('Likes', 0))
+    except Exception:
+        return jsonify({"error": "Parse failed", "status": 0}), 200
+
+    like_url = f"{URLS[server]}/LikeProfile"
+    stats = asyncio.run(broadcast_likes(uid, server, like_url, valid_accs))
+
+    a = get_info(enc_uid, server, tok)
+    if a is None:
+        return jsonify({"error": "Verify failed", "status": 0}), 200
+    try:
+        ad = json.loads(MessageToJson(a))
+        al = int(ad['AccountInfo']['Likes'])
+        pid = int(ad['AccountInfo']['UID'])
+        pn = str(ad['AccountInfo']['PlayerNickname'])
+        given = al - bl
+        st = 1 if given != 0 else 2
+        if given > 0:
+            tracker[ip][0] += 1
+            cnt += 1
+        return jsonify({
+            "LikesGivenByAPI": given,
+            "LikesafterCommand": al,
+            "LikesbeforeCommand": bl,
+            "PlayerNickname": pn,
+            "Server": server,
+            "UID": pid,
+            "status": st,
+            "Elapsed sec": round(time.time() - t0, 2),
+            "tokens_used": stats.get("success", 0),
+            "remains": f"({KEY_LIMIT - cnt}/{KEY_LIMIT})",
+            "Credit": f"🔥 MZ MINHAZ | {CHANNEL}"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 0}), 500
+
+@app.route('/reset-limit')
+def reset_limit():
+    ip = request.remote_addr
+    tracker[ip] = [0, time.time()]
+    return jsonify({
+        "message": "Limit reset",
+        "ip": ip,
+        "remains": f"({KEY_LIMIT}/{KEY_LIMIT})"
+    })
+
+# Vercel এ গ্লোবাল লোডিং
+load_all_tokens_from_files()
+
+# Vercel-এ মেইন ফাংশন রান হয় না, তাই থ্রেড কমেন্ট করা হলো
+if __name__ == '__main__':
+    print("🔥 MZ MINHAZ Like API — Server Starting")
+    print(f"📢 Channel : {CHANNEL}")
+    print(f"👤 Credit  : {CREDIT}")
+    print(f"Supported servers: {list(URLS.keys())}")
+    print(f"Speed: JWT={JWT_CONCURRENCY}x, LIKE={LIKE_CONCURRENCY}x")
+    print(f"Token check: every {CHECK_INTERVAL_MIN} min")
+    
+    # Vercel-এ threading কাজ করে না, তাই কমেন্ট করা হলো:
+    # threading.Thread(target=scheduler_loop, daemon=True).start()
+    
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)   return None
                     return a
             results = await asyncio.gather(*[one(a) for a in need_fetch], return_exceptions=True)
         valid_fetched = [r for r in results if isinstance(r, dict)]
